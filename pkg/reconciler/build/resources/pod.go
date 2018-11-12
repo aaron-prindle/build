@@ -19,27 +19,40 @@ limitations under the License.
 package resources
 
 import (
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	mrand "math/rand"
+	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"time"
 
+	"go.opencensus.io/trace"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 	v1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	"github.com/knative/build/pkg/credentials"
 	"github.com/knative/build/pkg/credentials/dockercreds"
 	"github.com/knative/build/pkg/credentials/gitcreds"
 	"github.com/knative/pkg/apis"
 	duckv1alpha1 "github.com/knative/pkg/apis/duck/v1alpha1"
+	"golang.org/x/oauth2/google"
 )
 
 const workspaceDir = "/workspace"
@@ -267,8 +280,9 @@ func MakePod(build *v1alpha1.Build, kubeclient kubernetes.Interface) (*corev1.Po
 	var sources []v1alpha1.SourceSpec
 	// if source is present convert into sources
 
-	// NOTES(aaron-prindle) adds custom steps outside of user Steps for git, logs, etc
-	podContainers := []corev1.Container{*cred}
+	initContainers := []corev1.Container{*cred}
+	podContainers := []corev1.Container{}
+
 	if source := build.Spec.Source; source != nil {
 		sources = []v1alpha1.SourceSpec{*source}
 	}
@@ -284,26 +298,37 @@ func MakePod(build *v1alpha1.Build, kubeclient kubernetes.Interface) (*corev1.Po
 			if err != nil {
 				return nil, err
 			}
-			podContainers = append(podContainers, *git)
+			initContainers = append(initContainers, *git)
 		case source.GCS != nil:
 			gcs, err := gcsToContainer(source, i)
 			if err != nil {
 				return nil, err
 			}
-			podContainers = append(podContainers, *gcs)
+			initContainers = append(initContainers, *gcs)
 		case source.Custom != nil:
 			cust, err := customToContainer(source.Custom, source.Name)
 			if err != nil {
 				return nil, err
 			}
 			// Prepend the custom container to the steps, to be augmented later with env, volume mounts, etc.
+
 			build.Spec.Steps = append([]corev1.Container{*cust}, build.Spec.Steps...)
 		}
 		// webhook validation checks that only one source has subPath defined
 		workspaceSubPath = source.SubPath
 	}
 
-	// NOTES(aaron-prindle) setup volume mounts for steps
+	// init container that copies entrypoint binary into shared volume
+	// to be used by all other containers w/ entrypoint rewriting
+	initContainers = append(initContainers,
+		corev1.Container{
+			Name:         InitContainerName,
+			Image:        DefaultEntrypointImage,
+			Command:      []string{"/bin/cp"},
+			Args:         []string{"/entrypoint", BinaryLocation},
+			VolumeMounts: []corev1.VolumeMount{toolsMount},
+		})
+
 	for i, step := range build.Spec.Steps {
 		step.Env = append(implicitEnvVars, step.Env...)
 		// TODO(mattmoor): Check that volumeMounts match volumes.
@@ -341,6 +366,7 @@ func MakePod(build *v1alpha1.Build, kubeclient kubernetes.Interface) (*corev1.Po
 	// declared user volumes.
 	volumes := append(build.Spec.Volumes, implicitVolumes...)
 	volumes = append(volumes, secrets...)
+	volumes = append(volumes, toolsVolume)
 	if err := v1alpha1.ValidateVolumes(volumes); err != nil {
 		return nil, err
 	}
@@ -351,19 +377,23 @@ func MakePod(build *v1alpha1.Build, kubeclient kubernetes.Interface) (*corev1.Po
 		return nil, err
 	}
 	gibberish := hex.EncodeToString(b)
-	// entrypoint.RedirectSteps(podContainers)
-	RedirectSteps(podContainers)
+
+	// Generate a unique name based on the build's name.
+	// Add a unique suffix to avoid confusion when a build
+	// is deleted and re-created with the same name.
+	// We don't use GenerateName here because k8s fakes don't support it.
+	name := fmt.Sprintf("%s-pod-%s", build.Name, gibberish)
+
+	if err := RedirectSteps(podContainers, kubeclient, build); err != nil {
+		return nil, fmt.Errorf("unable to rewrite entrypoint for %q: %s", name, err)
+	}
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			// We execute the build's pod in the same namespace as where the build was
 			// created so that it can access colocated resources.
 			Namespace: build.Namespace,
-			// Generate a unique name based on the build's name.
-			// Add a unique suffix to avoid confusion when a build
-			// is deleted and re-created with the same name.
-			// We don't use GenerateName here because k8s fakes don't support it.
-			Name: fmt.Sprintf("%s-pod-%s", build.Name, gibberish),
+			Name:      name,
 			// If our parent Build is deleted, then we should be as well.
 			OwnerReferences: []metav1.OwnerReference{
 				*metav1.NewControllerRef(build, schema.GroupVersionKind{
@@ -380,6 +410,7 @@ func MakePod(build *v1alpha1.Build, kubeclient kubernetes.Interface) (*corev1.Po
 		Spec: corev1.PodSpec{
 			// If the build fails, don't restart it.
 			RestartPolicy:      corev1.RestartPolicyNever,
+			InitContainers:     initContainers,
 			Containers:         podContainers,
 			ServiceAccountName: build.Spec.ServiceAccountName,
 			Volumes:            volumes,
@@ -400,14 +431,14 @@ func BuildStatusFromPod(p *corev1.Pod, buildSpec v1alpha1.BuildSpec) v1alpha1.Bu
 		StartTime: &p.CreationTimestamp,
 	}
 
-	// Always ignore the first pod status, which is creds-init.
+	// Always ignore the first pod status, which is entrypoint cp (creds-init)
 	skip := 1
 	if buildSpec.Source != nil {
 		// If the build specifies source, skip another container status, which
 		// is the source-fetching container.
 		skip++
 	}
-	// Also skip multiple sourcees specified by the build.
+	// Also skip multiple sources specified by the build.
 	skip += len(buildSpec.Sources)
 	if skip <= len(p.Status.InitContainerStatuses) {
 		for _, s := range p.Status.InitContainerStatuses[skip:] {
@@ -504,8 +535,15 @@ const (
 	BinaryLocation    = MountPoint + "/entrypoint"
 	JSONConfigEnvVar  = "ENTRYPOINT_OPTIONS"
 	InitContainerName = "place-tools"
-	ProcessLogFile    = "/tools/process-log.txt"
-	MarkerFile        = "/tools/marker-file.txt"
+	// TODO(aaron-prindle) change this to wherever is sensible
+	DefaultEntrypointImage = "gcr.io/aprindle-vm-test/entrypoint:latest"
+
+	ProcessLogFile        = "/tools/process-log.txt"
+	MarkerFile            = "/tools/marker-file.txt"
+	ShouldWaitForPrevStep = false
+	PreRunFile            = "0"
+	ShouldRunPostRun      = true
+	PostRunFile           = "0"
 )
 
 var toolsMount = corev1.VolumeMount{
@@ -513,23 +551,309 @@ var toolsMount = corev1.VolumeMount{
 	MountPath: MountPoint,
 }
 
+var toolsVolume = corev1.Volume{
+	Name: MountName,
+	VolumeSource: corev1.VolumeSource{
+		EmptyDir: &corev1.EmptyDirVolumeSource{},
+	},
+}
+
 type entrypointArgs struct {
 	Args       []string `json:"args"`
 	ProcessLog string   `json:"process_log"`
 	MarkerFile string   `json:"marker_file"`
+
+	ShouldWaitForPrevStep bool   `json:"shouldWaitForPrevStep"`
+	PreRunFile            string `json:"preRunFile"`
+	ShouldRunPostRun      bool   `json:"shouldRunPostRun"`
+	PostRunFile           string `json:"postRunFile"`
 }
+
+// Cache is a simple caching mechanism allowing for caching the results of
+// getting the Entrypoint of a container image from a remote registry. It
+// is synchronized via a mutex so that we can share a single Cache across
+// each worker thread that the reconciler is running. The mutex is necessary
+// due to the possibility of a panic if two workers were to attempt to read and
+// write to the internal map at the same time.
+type Cache struct {
+	mtx   sync.RWMutex
+	cache map[string][]string
+}
+
+// NewCache is a simple helper function that returns a pointer to a Cache that
+// has had the internal cache map initialized.
+func NewCache() *Cache {
+	return &Cache{
+		cache: make(map[string][]string),
+	}
+}
+
+func (c *Cache) get(sha string) ([]string, bool) {
+	c.mtx.RLock()
+	ep, ok := c.cache[sha]
+	c.mtx.RUnlock()
+	return ep, ok
+}
+
+func (c *Cache) set(sha string, ep []string) {
+	c.mtx.Lock()
+	c.cache[sha] = ep
+	c.mtx.Unlock()
+}
+
+type AuthToken struct {
+	AccessToken string
+	Endpoint    string
+}
+
+type dockerJSON struct {
+	Auths map[string]registryAuth `json:"auths,omitempty"`
+}
+
+type registryAuth struct {
+	Auth  string `json:"auth"`
+	Email string `json:"email"`
+}
+
+func getGCRAuthorizationKey() ([]AuthToken, error) {
+	ts, err := google.DefaultTokenSource(context.TODO(), "https://www.googleapis.com/auth/cloud-platform")
+	if err != nil {
+		return []AuthToken{}, err
+	}
+
+	token, err := ts.Token()
+	if err != nil {
+		return []AuthToken{}, err
+	}
+
+	if !token.Valid() {
+		return []AuthToken{}, fmt.Errorf("token was invalid")
+	}
+
+	if token.Type() != "Bearer" {
+		return []AuthToken{}, fmt.Errorf(fmt.Sprintf("expected token type \"Bearer\" but got \"%s\"", token.Type()))
+	}
+
+	return []AuthToken{
+		AuthToken{
+			AccessToken: token.AccessToken,
+			Endpoint:    "https://us.gcr.io"}, //TODO(aaron-prindle) make this work for all regions
+	}, nil
+}
+
+const (
+	interval = 1 * time.Second
+	timeout  = 5 * time.Minute
+)
+
+// WaitForServiceAccount polls the status of the Pod called name from client every
+// interval until inState returns `true` indicating it is done, returns an
+// error or timeout. desc will be used to name the metric that is emitted to
+// track how long it took for name to get into the state checked by inState.
+func WaitForServiceAccount(kubeclient kubernetes.Interface, name string, namespace string, desc string) error {
+	metricName := fmt.Sprintf("WaitForServiceAccountState/%s/%s", name, desc)
+	_, span := trace.StartSpan(context.Background(), metricName)
+	defer span.End()
+
+	return wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := kubeclient.CoreV1().ServiceAccounts(namespace).Get(name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil // TODO(aaron-prindle) better err msg?
+		}
+
+		return true, nil
+	})
+}
+
+// WaitForSecret polls the status of the Pod called name from client every
+// interval until inState returns `true` indicating it is done, returns an
+// error or timeout. desc will be used to name the metric that is emitted to
+// track how long it took for name to get into the state checked by inState.
+func WaitForSecret(kubeclient kubernetes.Interface, name string, namespace string, desc string) error {
+	metricName := fmt.Sprintf("WaitForServiceAccountState/%s/%s", name, desc)
+	_, span := trace.StartSpan(context.Background(), metricName)
+	defer span.End()
+
+	return wait.PollImmediate(interval, timeout, func() (bool, error) {
+		_, err := kubeclient.CoreV1().Secrets(namespace).Get(name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil // TODO(aaron-prindle) better err msg?
+		}
+
+		return true, nil
+	})
+}
+
+// TODO(aaron-prindle) i don't think this method will work...
+// var mutex = &sync.Mutex{}
+
+// GetRemoteEntrypoint accepts a cache of image lookups, as well as the image
+// to look for. If the cache does not contain the image, it will lookup the
+// metadata from the images registry, and then commit that to the cache
+func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Interface, build *v1alpha1.Build, dockercfgenv string) ([]string, error) {
+
+	// TODO(aaron-prindle) i don't think this method will work...
+	// hold lock
+	// mutex.Lock()
+	// defer mutex.Unlock()
+
+	serviceAccountName := build.Spec.ServiceAccountName
+	// if serviceAccountName == "" {
+	// 	serviceAccountName = "default"
+	// }
+	if serviceAccountName == "" || serviceAccountName == "default" {
+		// GKE metadata server authentication
+		tokens, err := getGCRAuthorizationKey()
+		if err != nil {
+			return nil, err
+		}
+
+		dockerCfgTemplate := `{ "auths": {"%s": { "auth": "%s", "email": "none"} } }`
+		authTemplate := `oauth2accesstoken:%s`
+		secretStr := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(authTemplate, tokens[0].AccessToken)))
+		dockercfg := []byte(fmt.Sprintf(dockerCfgTemplate, tokens[0].Endpoint, secretStr))
+
+		// use random DOCKER_CONFIG env var
+		// path := filepath.Join(dockercfgenv, ".docker")
+		path := filepath.Join(os.Getenv("HOME"), ".docker")
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			os.Mkdir(path, 0644)
+		}
+
+		// path = filepath.Join(dockercfgenv, ".docker", "config.json")
+		path = filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
+		err = ioutil.WriteFile(path, dockercfg, 0644)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// TODO(aaron-prindle) make sure to try all imagePullSecrets/registries
+		// TODO(aaron-prindle) see if there is a better way than blocking
+		WaitForServiceAccount(kubeclient, serviceAccountName, build.Namespace, "desc")
+		sa, err := kubeclient.CoreV1().ServiceAccounts(build.Namespace).Get(serviceAccountName, metav1.GetOptions{})
+		if err != nil {
+			return nil, err // TODO(aaron-prindle) better err msg?
+		}
+
+		fmt.Println(sa.ImagePullSecrets)
+		fmt.Println(len(sa.ImagePullSecrets))
+		for _, secret := range sa.ImagePullSecrets {
+			// TODO(aaron-prindle) see if there is a better way than blocking
+			WaitForSecret(kubeclient, secret.Name, build.Namespace, "desc")
+			scrt, err := kubeclient.CoreV1().Secrets(build.Namespace).Get(secret.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err // TODO(aaron-prindle) better err msg?
+			}
+
+			// path := filepath.Join(dockercfgenv, ".docker")
+			path := filepath.Join(os.Getenv("HOME"), ".docker")
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				os.Mkdir(path, 0644)
+			}
+			// TODO(aaron-prindle) see if there is a way to pass the auth to go-containerregisty
+			// to avoid writing .docker/config.json file
+			// parallelism might be a concern w/ a file
+			// path = filepath.Join(dockercfgenv, ".docker", "config.json")
+
+			// TODO(aaron-prindle) support .dockerconfigjson and .dockercfg
+			if _, ok := scrt.Data[".dockerconfigjson"]; ok {
+				path = filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
+				err = ioutil.WriteFile(path, scrt.Data[".dockerconfigjson"], 0644)
+				if err != nil {
+					return nil, err
+				}
+			} else if _, ok := scrt.Data[".dockercfg"]; ok {
+				return nil, fmt.Errorf(".dockercfg is currently not supported")
+				// fmt.Println("==========")
+				// fmt.Println(scrt.Data[".dockercfg"])
+				// fmt.Println("==========")
+				// convert .dockercfg info to .docker/config.json format
+				// serialize to json
+				// grab "auth" field
+				// base64 decode that
+				// convert to json (need to drop _json_key thing?)
+				// grab private_key field
+				// create new json with .docker/config.json format
+
+				// path = filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
+				// err = ioutil.WriteFile(path, scrt.Data[".dockerconfigjson"], 0644)
+				// if err != nil {
+				// 	return nil, err
+				// }
+
+			} else {
+				// TODO(aaron-prindle) warn/error? that no docker info in secret
+			}
+		}
+	}
+
+	if ep, ok := cache.get(image); ok {
+		return ep, nil
+	}
+
+	// verify the image name, then download the remote config file
+	ref, err := name.ParseReference(image, name.WeakValidation)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't parse image %s: %v", image, err)
+	}
+	// TODO(aaron-prindle) have retry setup for the various methods
+	img, err := remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get container image info from registry %s: %v", image, err)
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get config for image %s: %v", image, err)
+	}
+	cache.set(image, cfg.Config.Entrypoint)
+	return cfg.Config.Entrypoint, nil
+}
+
+const letterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+func RandStringBytes(n int) string {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letterBytes[mrand.Intn(len(letterBytes))]
+	}
+	return string(b)
+}
+
+// TODO(aaron-prindle) setup the cache properly
+var cache = NewCache()
 
 // RedirectSteps will modify each of the steps/containers such that
 // the binary being run is no longer the one specified by the Command
 // and the Args, but is instead the entrypoint binary, which will
 // itself invoke the Command and Args, but also capture logs.
-func RedirectSteps(steps []corev1.Container) error {
+func RedirectSteps(steps []corev1.Container, kubeclient kubernetes.Interface, build *v1alpha1.Build) error {
+	// For each step with no entrypoint set, try to populate it with the info
+	// from the remote registry
+	dockercfgenv := RandStringBytes(10)
+	dockercfgenv = "/" + dockercfgenv
+	// gen random string
 	for i := range steps {
 		step := &steps[i]
-		e, err := getEnvVar(step.Command, step.Args)
+		if len(step.Command) == 0 {
+			ep, err := GetRemoteEntrypoint(cache, step.Image, kubeclient, build, dockercfgenv)
+			if err != nil {
+				return fmt.Errorf("could not get entrypoint from registry for %s: %v", step.Image, err)
+			}
+			step.Command = ep
+		}
+		e, err := getEnvVar(step.Command, step.Args, i)
+		if i != 0 {
+			step.Resources = corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					// Must set memory limit to get MemoryStats.AvailableBytes
+					corev1.ResourceCPU: resource.MustParse("0m"),
+				},
+			}
+		}
 		if err != nil {
 			return fmt.Errorf("couldn't get env var for entrypoint: %s", err)
 		}
+
 		step.Command = []string{BinaryLocation}
 		step.Args = []string{}
 
@@ -542,16 +866,25 @@ func RedirectSteps(steps []corev1.Container) error {
 	return nil
 }
 
-func getEnvVar(cmd, args []string) (string, error) {
+func getEnvVar(cmd, args []string, stepNumber int) (string, error) {
+	shouldWaitForPrevStep := ShouldWaitForPrevStep
+	// TODO(aaron-prindle) modify ShouldRunPostRun to not run on last step
+	if stepNumber != 0 {
+		shouldWaitForPrevStep = true
+	}
+
 	entrypointArgs := entrypointArgs{
-		Args:       append(cmd, args...),
-		ProcessLog: ProcessLogFile,
-		MarkerFile: MarkerFile,
-		// TODO(aaron-prindle) add the new options here
+		Args:                  append(cmd, args...),
+		ProcessLog:            ProcessLogFile,
+		MarkerFile:            MarkerFile,
+		ShouldWaitForPrevStep: shouldWaitForPrevStep,
+		PreRunFile:            filepath.Join(MountPoint, strconv.Itoa(stepNumber)),
+		ShouldRunPostRun:      ShouldRunPostRun,
+		PostRunFile:           filepath.Join(MountPoint, strconv.Itoa(stepNumber+1)),
 	}
 	j, err := json.Marshal(entrypointArgs)
 	if err != nil {
-		return "", fmt.Errorf("couldn't marshal arguments %q for entrypoint env var: %s", entrypointArgs, err)
+		return "", fmt.Errorf("couldn't marshal arguments %v for entrypoint env var: %s", entrypointArgs, err)
 	}
 	return string(j), nil
 }
