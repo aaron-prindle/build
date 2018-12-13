@@ -21,7 +21,6 @@ package resources
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -45,6 +44,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	v1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	"github.com/knative/build/pkg/credentials"
@@ -684,23 +684,47 @@ func WaitForSecret(kubeclient kubernetes.Interface, name string, namespace strin
 	})
 }
 
-// TODO(aaron-prindle) i don't think this method will work...
-// var mutex = &sync.Mutex{}
+// GetRemoteEntrypoint accepts a cache of image lookups, as well as the image
+// to look for. If the cache does not contain the image, it will lookup the
+// metadata from the images registry, and then commit that to the cache
+func GetRemoteEntrypointAnon(cache *Cache, image string) ([]string, error) {
+	if ep, ok := cache.get(image); ok {
+		return ep, nil
+	}
+	// verify the image name, then download the remote config file
+	ref, err := name.ParseReference(image, name.WeakValidation)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't parse image %s: %v", image, err)
+	}
+	img, err := remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get container image info from registry %s: %v", image, err)
+	}
+	cfg, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("couldn't get config for image %s: %v", image, err)
+	}
+	// cache.set(image, cfg.ContainerConfig.Entrypoint)
+	return cfg.ContainerConfig.Entrypoint, nil
+}
 
 // GetRemoteEntrypoint accepts a cache of image lookups, as well as the image
 // to look for. If the cache does not contain the image, it will lookup the
 // metadata from the images registry, and then commit that to the cache
 func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Interface, build *v1alpha1.Build, dockercfgenv string) ([]string, error) {
 
-	// TODO(aaron-prindle) i don't think this method will work...
-	// hold lock
-	// mutex.Lock()
-	// defer mutex.Unlock()
+	// try first w/o auth
+	// if it doesn't succeed, try the other methods
+	out, err := GetRemoteEntrypointAnon(cache, image)
+	if err == nil {
+		return out, nil
+	}
+	if err != nil {
+		fmt.Printf("GetRemoteEntrypointAnon FAILED: %v", err)
+	}
 
 	serviceAccountName := build.Spec.ServiceAccountName
-	// if serviceAccountName == "" {
-	// 	serviceAccountName = "default"
-	// }
+	var img v1.Image
 	if serviceAccountName == "" || serviceAccountName == "default" {
 		// GKE metadata server authentication
 		tokens, err := getGCRAuthorizationKey()
@@ -708,24 +732,27 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 			return nil, err
 		}
 
-		dockerCfgTemplate := `{ "auths": {"%s": { "auth": "%s", "email": "none"} } }`
-		authTemplate := `oauth2accesstoken:%s`
-		secretStr := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(authTemplate, tokens[0].AccessToken)))
-		dockercfg := []byte(fmt.Sprintf(dockerCfgTemplate, tokens[0].Endpoint, secretStr))
-
-		// use random DOCKER_CONFIG env var
-		// path := filepath.Join(dockercfgenv, ".docker")
 		path := filepath.Join(os.Getenv("HOME"), ".docker")
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			os.Mkdir(path, 0644)
 		}
 
-		// path = filepath.Join(dockercfgenv, ".docker", "config.json")
-		path = filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
-		err = ioutil.WriteFile(path, dockercfg, 0644)
-		if err != nil {
-			return nil, err
+		if ep, ok := cache.get(image); ok {
+			return ep, nil
 		}
+
+		// verify the image name, then download the remote config file
+		ref, err := name.ParseReference(image, name.WeakValidation)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't parse image %s: %v", image, err)
+		}
+		// TODO(aaron-prindle) have retry setup for the various methods
+		img, err = remote.Image(ref, remote.WithAuth(
+			&authn.Bearer{Token: tokens[0].AccessToken}))
+		if err != nil {
+			return nil, fmt.Errorf("couldn't get container image info from registry %s: %v", image, err)
+		}
+
 	} else {
 		// TODO(aaron-prindle) make sure to try all imagePullSecrets/registries
 		// TODO(aaron-prindle) see if there is a better way than blocking
@@ -735,8 +762,6 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 			return nil, err // TODO(aaron-prindle) better err msg?
 		}
 
-		fmt.Println(sa.ImagePullSecrets)
-		fmt.Println(len(sa.ImagePullSecrets))
 		for _, secret := range sa.ImagePullSecrets {
 			// TODO(aaron-prindle) see if there is a better way than blocking
 			WaitForSecret(kubeclient, secret.Name, build.Namespace, "desc")
@@ -764,43 +789,25 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 				}
 			} else if _, ok := scrt.Data[".dockercfg"]; ok {
 				return nil, fmt.Errorf(".dockercfg is currently not supported")
-				// fmt.Println("==========")
-				// fmt.Println(scrt.Data[".dockercfg"])
-				// fmt.Println("==========")
-				// convert .dockercfg info to .docker/config.json format
-				// serialize to json
-				// grab "auth" field
-				// base64 decode that
-				// convert to json (need to drop _json_key thing?)
-				// grab private_key field
-				// create new json with .docker/config.json format
-
-				// path = filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
-				// err = ioutil.WriteFile(path, scrt.Data[".dockerconfigjson"], 0644)
-				// if err != nil {
-				// 	return nil, err
-				// }
-
 			} else {
 				// TODO(aaron-prindle) warn/error? that no docker info in secret
 			}
 		}
+		if ep, ok := cache.get(image); ok {
+			return ep, nil
+		}
+
+		// verify the image name, then download the remote config file
+		ref, err := name.ParseReference(image, name.WeakValidation)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't parse image %s: %v", image, err)
+		}
+		img, err = remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+		if err != nil {
+			return nil, fmt.Errorf("couldn't get container image info from registry %s: %v", image, err)
+		}
 	}
 
-	if ep, ok := cache.get(image); ok {
-		return ep, nil
-	}
-
-	// verify the image name, then download the remote config file
-	ref, err := name.ParseReference(image, name.WeakValidation)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't parse image %s: %v", image, err)
-	}
-	// TODO(aaron-prindle) have retry setup for the various methods
-	img, err := remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
-	if err != nil {
-		return nil, fmt.Errorf("couldn't get container image info from registry %s: %v", image, err)
-	}
 	cfg, err := img.ConfigFile()
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get config for image %s: %v", image, err)
