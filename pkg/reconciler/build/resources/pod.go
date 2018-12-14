@@ -775,10 +775,6 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 			if _, err := os.Stat(path); os.IsNotExist(err) {
 				os.Mkdir(path, 0644)
 			}
-			// TODO(aaron-prindle) see if there is a way to pass the auth to go-containerregisty
-			// to avoid writing .docker/config.json file
-			// parallelism might be a concern w/ a file
-			// path = filepath.Join(dockercfgenv, ".docker", "config.json")
 
 			// TODO(aaron-prindle) support .dockerconfigjson and .dockercfg
 			if _, ok := scrt.Data[".dockerconfigjson"]; ok {
