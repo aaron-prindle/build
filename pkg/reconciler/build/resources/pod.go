@@ -21,6 +21,7 @@ package resources
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -43,6 +44,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/authn/k8schain"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -607,12 +609,30 @@ type AuthToken struct {
 }
 
 type dockerJSON struct {
-	Auths map[string]registryAuth `json:"auths,omitempty"`
+	Auths       map[string]authEntry `json:"auths"`
+	HTTPHeaders map[string]string    `json:"HttpHeaders"`
 }
 
-type registryAuth struct {
-	Auth  string `json:"auth"`
-	Email string `json:"email"`
+// authEntry is a helper for JSON parsing an "auth" entry of config.json
+// This is not meant for direct consumption.
+type authEntry struct {
+	Auth     string `json:"auth"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	Email    string `json:"email,omitempty"`
+}
+
+type dockerSecret struct {
+	Type                    string `json:"type"`
+	ProjectID               string `json:"project_id"`
+	PrivateKeyID            string `json:"private_key_id"`
+	PrivateKey              string `json:"private_key"`
+	ClientEmail             string `json:"client_email"`
+	ClientID                string `json:"client_id"`
+	AuthURI                 string `json:"auth_uri"`
+	TokenURI                string `json:"token_uri"`
+	AuthProviderX509CertURL string `json:"auth_provider_x509_cert_url"`
+	ClientX509CertURL       string `json:"client_x509_cert_url"`
 }
 
 func getGCRAuthorizationKey() ([]AuthToken, error) {
@@ -770,19 +790,59 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 				return nil, err // TODO(aaron-prindle) better err msg?
 			}
 
-			// path := filepath.Join(dockercfgenv, ".docker")
-			path := filepath.Join(os.Getenv("HOME"), ".docker")
-			if _, err := os.Stat(path); os.IsNotExist(err) {
-				os.Mkdir(path, 0644)
-			}
-
 			// TODO(aaron-prindle) support .dockerconfigjson and .dockercfg
 			if _, ok := scrt.Data[".dockerconfigjson"]; ok {
-				path = filepath.Join(os.Getenv("HOME"), ".docker", "config.json")
-				err = ioutil.WriteFile(path, scrt.Data[".dockerconfigjson"], 0644)
+				dockerconfigjson := scrt.Data[".dockerconfigjson"]
+				decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerscrt))
 				if err != nil {
 					return nil, err
 				}
+				// marshall decoded secret to json?
+				var dat dockerJSON
+				if err := json.Unmarshal(decodedconfigjson, dat); err != nil {
+					return nil, err
+				}
+				for _, registry := range dat.Auths {
+					reg, err := name.NewRegistry("fake.registry.io", name.WeakValidation)
+					if err != nil {
+						return nil, fmt.Errorf("NewRegistry() = %v", err)
+					}
+					kc, err := k8schain.New(kubeclient, Options{})
+					if err != nil {
+						return nil, fmt.Errorf("New() = %v", err)
+					}
+
+					auth, err := kc.Resolve(reg)
+					if err != nil {
+						return nil, fmt.Errorf("Resolve(%v) = %v", reg, err)
+					}
+				}
+				// dockerconfigjson := scrt.Data[".dockerconfigjson"]
+				// decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerscrt))
+				// if err != nil {
+				// 	return nil, err
+				// }
+				// // marshall decoded secret to json?
+				// var dat dockerJSON
+				// if err := json.Unmarshal(decodedconfigjson, dat); err != nil {
+				// 	return nil, err
+				// }
+				// // get `auth` value
+				// auth := dat.Auths["gcr.io"].Auth
+				// // base64 decode that
+				// decodedauth, err := base64.StdEncoding.DecodeString(auth)
+				// if err != nil {
+				// 	return nil, err
+				// }
+				// // convert to yaml and strip beginning part `_json_key:`
+				// var dockerscrt dockerSecret
+				// if err := json.Unmarshal(decodedauth[10:], dockerscrt); err != nil {
+				// 	return nil, err
+				// }
+				// dockerscrt.PrivateKey
+				// img, err = remote.Image(ref, remote.WithAuth(
+				// 	&authn.Bearer{Token: tokens[0].AccessToken}))
+
 			} else if _, ok := scrt.Data[".dockercfg"]; ok {
 				return nil, fmt.Errorf(".dockercfg is currently not supported")
 			} else {
