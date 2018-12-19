@@ -43,11 +43,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/authn/k8schain"
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/aaron-prindle/go-containerregistry/pkg/authn"
+	"github.com/aaron-prindle/go-containerregistry/pkg/authn/k8schain"
+	"github.com/aaron-prindle/go-containerregistry/pkg/name"
+	regv1 "github.com/aaron-prindle/go-containerregistry/pkg/v1"
+	"github.com/aaron-prindle/go-containerregistry/pkg/v1/remote"
+
 	v1alpha1 "github.com/knative/build/pkg/apis/build/v1alpha1"
 	"github.com/knative/build/pkg/credentials"
 	"github.com/knative/build/pkg/credentials/dockercreds"
@@ -744,7 +745,7 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 	}
 
 	serviceAccountName := build.Spec.ServiceAccountName
-	var img v1.Image
+	var img regv1.Image
 	if serviceAccountName == "" || serviceAccountName == "default" {
 		// GKE metadata server authentication
 		tokens, err := getGCRAuthorizationKey()
