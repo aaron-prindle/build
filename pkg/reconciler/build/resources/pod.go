@@ -29,7 +29,6 @@ import (
 	"io"
 	"io/ioutil"
 	mrand "math/rand"
-	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -753,11 +752,6 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 			return nil, err
 		}
 
-		path := filepath.Join(os.Getenv("HOME"), ".docker")
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			os.Mkdir(path, 0644)
-		}
-
 		if ep, ok := cache.get(image); ok {
 			return ep, nil
 		}
@@ -794,7 +788,7 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 			// TODO(aaron-prindle) support .dockerconfigjson and .dockercfg
 			if _, ok := scrt.Data[".dockerconfigjson"]; ok {
 				dockerconfigjson := scrt.Data[".dockerconfigjson"]
-				decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerscrt))
+				decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerconfigjson))
 				if err != nil {
 					return nil, err
 				}
@@ -803,12 +797,12 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 				if err := json.Unmarshal(decodedconfigjson, dat); err != nil {
 					return nil, err
 				}
-				for _, registry := range dat.Auths {
-					reg, err := name.NewRegistry("fake.registry.io", name.WeakValidation)
+				for registry := range dat.Auths {
+					reg, err := name.NewRegistry(registry, name.WeakValidation)
 					if err != nil {
 						return nil, fmt.Errorf("NewRegistry() = %v", err)
 					}
-					kc, err := k8schain.New(kubeclient, Options{})
+					kc, err := k8schain.New(kubeclient, k8schain.Options{})
 					if err != nil {
 						return nil, fmt.Errorf("New() = %v", err)
 					}
@@ -817,6 +811,22 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 					if err != nil {
 						return nil, fmt.Errorf("Resolve(%v) = %v", reg, err)
 					}
+
+					if ep, ok := cache.get(image); ok {
+						return ep, nil
+					}
+
+					// verify the image name, then download the remote config file
+					ref, err := name.ParseReference(image, name.WeakValidation)
+					if err != nil {
+						return nil, fmt.Errorf("couldn't parse image %s: %v", image, err)
+					}
+					// TODO(aaron-prindle) have retry setup for the various methods
+					img, err = remote.Image(ref, remote.WithAuth(auth))
+					if err != nil {
+						return nil, fmt.Errorf("couldn't get container image info from registry %s: %v", image, err)
+					}
+
 				}
 				// dockerconfigjson := scrt.Data[".dockerconfigjson"]
 				// decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerscrt))
