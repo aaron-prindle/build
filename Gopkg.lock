@@ -18,18 +18,18 @@
   version = "v0.2.0"
 
 [[projects]]
-  digest = "1:9f6373cf5f4b5d15d0ca976b131ed844e91724ee1c1112b028e4d9311c9f7fcb"
+  digest = "1:f56288257633effcb1743f6fa77d12dd3eaeeb5c78b3de6e199eb1b4780f57f5"
   name = "github.com/Azure/azure-sdk-for-go"
   packages = [
     "services/containerregistry/mgmt/2017-10-01/containerregistry",
     "version",
   ]
   pruneopts = "NUT"
-  revision = "199e71492c8f8ffb9d1d9432d425a1c8731fba19"
-  version = "v23.2.0"
+  revision = "4e8cbbfb1aeab140cd0fa97fd16b64ee18c3ca6a"
+  version = "v19.1.0"
 
 [[projects]]
-  digest = "1:44a1ddb10a1ee66aa8b7625b507829d30a423e555690b8db840f8caf35cb0e79"
+  digest = "1:187e4d8953228d79bceea7c23c5afe1de4ae040876bfffecee0b65aa73acb756"
   name = "github.com/Azure/go-autorest"
   packages = [
     "autorest",
@@ -39,11 +39,11 @@
     "autorest/to",
     "autorest/validation",
     "logger",
-    "tracing",
+    "version",
   ]
   pruneopts = "NUT"
-  revision = "f401b1ccc8eb505927fae7a0c7f6406d37ca1c7e"
-  version = "v11.2.8"
+  revision = "dd94e014aaf16d1df746762e392aa201c1b4c461"
+  version = "v10.15.0"
 
 [[projects]]
   branch = "master"
