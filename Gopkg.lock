@@ -47,13 +47,14 @@
 
 [[projects]]
   branch = "master"
-  digest = "1:41db2f255be6a843ce271c7be6a678559603f09efdd0f08a846aa92b8fa6a806"
+  digest = "1:f12f00df690fa64deb9e45567a9bb981843d09d9ad2c1ed06afc483d15569094"
   name = "github.com/aaron-prindle/go-containerregistry"
   packages = [
     "pkg/authn",
     "pkg/authn/k8schain",
     "pkg/name",
     "pkg/v1",
+    "pkg/v1/google",
     "pkg/v1/partial",
     "pkg/v1/remote",
     "pkg/v1/remote/transport",
@@ -1085,7 +1086,7 @@
     "github.com/aaron-prindle/go-containerregistry/pkg/authn",
     "github.com/aaron-prindle/go-containerregistry/pkg/authn/k8schain",
     "github.com/aaron-prindle/go-containerregistry/pkg/name",
-    "github.com/aaron-prindle/go-containerregistry/pkg/v1",
+    "github.com/aaron-prindle/go-containerregistry/pkg/v1/google",
     "github.com/aaron-prindle/go-containerregistry/pkg/v1/remote",
     "github.com/google/go-cmp/cmp",
     "github.com/google/go-cmp/cmp/cmpopts",
