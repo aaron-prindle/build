@@ -21,7 +21,6 @@ package resources
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -752,10 +751,6 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 			return nil, err
 		}
 
-		if ep, ok := cache.get(image); ok {
-			return ep, nil
-		}
-
 		// verify the image name, then download the remote config file
 		ref, err := name.ParseReference(image, name.WeakValidation)
 		if err != nil {
@@ -788,33 +783,51 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 			// TODO(aaron-prindle) support .dockerconfigjson and .dockercfg
 			if _, ok := scrt.Data[".dockerconfigjson"]; ok {
 				dockerconfigjson := scrt.Data[".dockerconfigjson"]
-				decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerconfigjson))
-				if err != nil {
-					return nil, err
-				}
+				fmt.Println("==========")
+				fmt.Println(string(dockerconfigjson))
+				fmt.Println("==========")
+				// decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerconfigjson))
+				// fmt.Println("==========")
+				// fmt.Println(decodedconfigjson)
+				// fmt.Println("==========")
+				// if err != nil {
+				// 	return nil, err
+				// }
 				// marshall decoded secret to json?
 				var dat dockerJSON
-				if err := json.Unmarshal(decodedconfigjson, dat); err != nil {
+				if err := json.Unmarshal(dockerconfigjson, &dat); err != nil {
 					return nil, err
 				}
+				fmt.Println("==========")
+				fmt.Println(dat.Auths)
+				fmt.Println("==========")
 				for registry := range dat.Auths {
 					reg, err := name.NewRegistry(registry, name.WeakValidation)
 					if err != nil {
 						return nil, fmt.Errorf("NewRegistry() = %v", err)
 					}
-					kc, err := k8schain.New(kubeclient, k8schain.Options{})
+					fmt.Println("==========")
+					fmt.Println(serviceAccountName)
+					fmt.Println("==========")
+					kc, err := k8schain.NewInCluster(k8schain.Options{
+						Namespace:          "default",
+						ServiceAccountName: serviceAccountName,
+					})
 					if err != nil {
 						return nil, fmt.Errorf("New() = %v", err)
 					}
 
+					fmt.Println("==========")
+					fmt.Println("RESOLVING")
+					fmt.Println("==========")
 					auth, err := kc.Resolve(reg)
 					if err != nil {
 						return nil, fmt.Errorf("Resolve(%v) = %v", reg, err)
 					}
 
-					if ep, ok := cache.get(image); ok {
-						return ep, nil
-					}
+					// if ep, ok := cache.get(image); ok {
+					// 	return ep, nil
+					// }
 
 					// verify the image name, then download the remote config file
 					ref, err := name.ParseReference(image, name.WeakValidation)
@@ -822,6 +835,13 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 						return nil, fmt.Errorf("couldn't parse image %s: %v", image, err)
 					}
 					// TODO(aaron-prindle) have retry setup for the various methods
+					got, err := auth.Authorization()
+					fmt.Println("==========")
+					fmt.Println(got)
+					fmt.Println("==========")
+					if err != nil {
+						return nil, fmt.Errorf("Authorization() = %v", err)
+					}
 					img, err = remote.Image(ref, remote.WithAuth(auth))
 					if err != nil {
 						return nil, fmt.Errorf("couldn't get container image info from registry %s: %v", image, err)
@@ -829,7 +849,7 @@ func GetRemoteEntrypoint(cache *Cache, image string, kubeclient kubernetes.Inter
 
 				}
 				// dockerconfigjson := scrt.Data[".dockerconfigjson"]
-				// decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerscrt))
+				// decodedconfigjson, err := base64.StdEncoding.DecodeString(string(dockerconfigjson))
 				// if err != nil {
 				// 	return nil, err
 				// }
